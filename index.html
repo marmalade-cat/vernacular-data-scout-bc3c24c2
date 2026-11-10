@@ -1,0 +1,165 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Vernacular Data Scout — Prototype</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;max-width:900px;margin:24px}
+textarea{width:100%;height:80px}
+button{padding:8px 12px;margin:6px 0}
+pre{background:#f6f6f6;padding:10px;overflow:auto}
+table{border-collapse:collapse;width:100%}
+td,th{border:1px solid #ddd;padding:6px}
+.small{font-size:0.9em;color:#555}
+</style>
+</head>
+<body>
+<h2>Vernacular-Data-Scout (prototype)</h2>
+<p class="small">Paste URLs (Wikipedia article and at least africavernaculararchitecture.com page recommended). This runs in your browser. CORS may block some fetches; failures are reported.</p>
+<textarea id="urls" placeholder="https://en.wikipedia.org/...\nhttps://africavernaculararchitecture.com/..."></textarea>
+<br>
+<button id="scan">Scan</button>
+<button id="download" disabled>Download consolidated CSV</button>
+<h3>Report</h3>
+<div id="report"></div>
+<h3>Raw logs</h3>
+<pre id="log"></pre>
+<script>
+async function fetchText(url){
+  try{
+    const r = await fetch(url);
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return await r.text();
+  }catch(e){ throw new Error('Fetch failed: '+e.message); }
+}
+function log(msg){ document.getElementById('log').textContent += msg + '\n'; }
+function guessLinksFromHtml(baseUrl, html){
+  const a = document.createElement('div'); a.innerHTML = html;
+  const out=[];
+  a.querySelectorAll('a[href]').forEach(el=>{
+    let href = el.getAttribute('href');
+    try{ href = new URL(href, baseUrl).href; out.push(href);}catch(e){}
+  });
+  // unique
+  return Array.from(new Set(out));
+}
+function looksLikeDataFile(url){ return /\.(csv|json)(\?|$)/i.test(url); }
+function tryParseCSV(text){
+  const lines = text.split(/\r?\n/).filter(l=>l.trim()!='');
+  if(lines.length<1) return null;
+  const header = lines[0].split(/,|;|\t/).map(h=>h.trim());
+  const rows = lines.slice(1).map(l=>{
+    // naive CSV split
+    const cols = l.split(/,|;|\t/).map(c=>c.trim());
+    const obj={}; header.forEach((h,i)=> obj[h]=cols[i]===undefined?'':cols[i]);
+    return obj;
+  });
+  return {header,rows};
+}
+function tryParseJSON(text){
+  try{ const j = JSON.parse(text); return j;}catch(e){return null}
+}
+function findPoseRecordInObject(obj){
+  // obj can be array of records or object with records array
+  const candidates = Array.isArray(obj)?obj: (obj.records||obj.items||obj.data||[]);
+  if(!Array.isArray(candidates)) return null;
+  const mapped = [];
+  for(const rec of candidates){
+    const keys = Object.keys(rec).map(k=>k.toLowerCase());
+    // heuristics
+    const timeKey = keys.find(k=>/(time|date|timestamp)/.test(k));
+    const x = keys.find(k=>/\b(x|posx|lng|lon|longitude)\b/.test(k));
+    const y = keys.find(k=>/\b(y|posy|lat|latitude)\b/.test(k));
+    const z = keys.find(k=>/\b(z|posz|alt|elev|height)\b/.test(k));
+    const qx = keys.find(k=>/(quat_?x|qx|q1)/.test(k));
+    const qy = keys.find(k=>/(quat_?y|qy|q2)/.test(k));
+    const qz = keys.find(k=>/(quat_?z|qz|q3)/.test(k));
+    const qw = keys.find(k=>/(quat_?w|qw|q0)/.test(k));
+    if(x&&y){
+      mapped.push({timeKey:timeKey?timeKey:null,xKey:x,yKey:y,zKey:z||null,qx,qy,qz,qw,raw:rec});
+    }
+  }
+  return mapped.length?mapped:null;
+}
+function normalizeRecord(id, recMap, srcUrl){
+  const r = recMap.raw;
+  function v(k){ return k? r[Object.keys(r).find(k2=>k2.toLowerCase()===k)]:'' }
+  // timestamp normalization: try ISO / epoch
+  let ts = '';
+  if(recMap.timeKey){ const t = v(recMap.timeKey); if(typeof t==='number') ts = new Date(t*1000).toISOString(); else { const d=new Date(t); if(!isNaN(d)) ts=d.toISOString(); else ts=''; }}
+  const x = parseFloat(v(recMap.xKey)||'');
+  const y = parseFloat(v(recMap.yKey)||'');
+  const z = recMap.zKey?parseFloat(v(recMap.zKey)||'') : '';
+  const qx = recMap.qx?parseFloat(v(recMap.qx)||'') : '';
+  const qy = recMap.qy?parseFloat(v(recMap.qy)||'') : '';
+  const qz = recMap.qz?parseFloat(v(recMap.qz)||'') : '';
+  const qw = recMap.qw?parseFloat(v(recMap.qw)||'') : '';
+  return {id, timestamp:ts, x:isNaN(x)?'':x, y:isNaN(y)?'':y, z:isNaN(z)?'':z, quat_x:qx||'', quat_y:qy||'', quat_z:qz||'', quat_w:qw||'', source_url:srcUrl};
+}
+function toCSV(rows){
+  const hdr = ['id','timestamp','x','y','z','quat_x','quat_y','quat_z','quat_w','source_url'];
+  const lines = [hdr.join(',')];
+  for(const r of rows){
+    lines.push(hdr.map(h=> (r[h]===undefined?'':String(r[h])).replace(/"/g,'""')).map(v=> '"'+v+'"').join(','));
+  }
+  return lines.join('\n');
+}
+
+document.getElementById('scan').onclick = async ()=>{
+  const urls = document.getElementById('urls').value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+  document.getElementById('report').textContent=''; document.getElementById('log').textContent='';
+  const discovered = [];
+  const parsedRecords = [];
+  let idCounter=1;
+  for(const u of urls){
+    log('Fetching page: '+u);
+    let html;
+    try{ html = await fetchText(u); }
+    catch(e){ log('  PAGE FETCH ERROR: '+e.message); continue; }
+    const links = guessLinksFromHtml(u, html).filter(looksLikeDataFile);
+    log('  discovered '+links.length+' data links');
+    for(const link of links){
+      log('   -> '+link);
+      try{
+        const txt = await fetchText(link);
+        let parsed=null;
+        if(/\.csv(\?|$)/i.test(link) || (!/\.json(\?|$)/i.test(link) && txt.trim().startsWith('"')||txt.includes(','))){
+          parsed = tryParseCSV(txt);
+          if(parsed){
+            // attempt to map header names to lower-case keys in records
+            for(const r of parsed.rows){
+              // normalize keys to original header names (already used)
+              const recMap = findPoseRecordInObject([r])[0];
+              if(recMap){ parsedRecords.push(normalizeRecord('r'+(idCounter++), recMap, link)); }
+            }
+          }
+        }
+        const j = tryParseJSON(txt);
+        if(j){
+          const found = findPoseRecordInObject(j);
+          if(found){
+            for(const fm of found){ parsedRecords.push(normalizeRecord('r'+(idCounter++), fm, link)); }
+          }
+        }
+      }catch(e){ log('     DATA FETCH/PARSE ERROR: '+e.message); }
+    }
+  }
+  // Summary
+  const reportEl = document.getElementById('report');
+  if(parsedRecords.length===0){ reportEl.textContent = 'No pose/time records detected. See logs for details (CORS failures common).'; }
+  else{
+    // quick quality metrics
+    const haveTime = parsedRecords.filter(r=>r.timestamp).length;
+    const havePos = parsedRecords.filter(r=> r.x!=='' && r.y!=='').length;
+    const haveQuat = parsedRecords.filter(r=> r.quat_x!==''&&r.quat_y!==''&&r.quat_z!==''&&r.quat_w!=='').length;
+    reportEl.innerHTML = '<p>Records found: '+parsedRecords.length+'</p>'+
+      '<p>With timestamp: '+haveTime+'; with position x,y: '+havePos+'; with quaternion: '+haveQuat+'</p>';
+    // store in button
+    const blobCsv = new Blob([toCSV(parsedRecords)],{type:'text/csv'});
+    const url = URL.createObjectURL(blobCsv);
+    const dl = document.getElementById('download'); dl.disabled=false; dl.onclick = ()=>{ const a=document.createElement('a'); a.href=url; a.download='scout_export.csv'; a.click(); };
+  }
+};
+</script>
+</body>
+</html>
